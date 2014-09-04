@@ -1,0 +1,233 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use IO::Socket;
+use Log::Handler;
+use Proc::Daemon;
+use DBI;
+use Getopt::Long;
+
+our $VERSION = '1.2';
+
+# Per site configurable variables
+my $dbdriver    = 'mysql';
+my $dbserver    = 'localhost';
+my $database    = 'stats';
+my $dbusername  = 'root';
+my $dbpassword  = 'password';
+my $listen_port = 8049;
+
+# Configure this function to return the path to the maildir file for
+# your particular virtual hosting configuration. It could also be a
+# database or ldap lookup if that's how you get the path.
+sub _generate_maildir_path {
+  my $local_part = shift();
+  my $domain     = shift();
+  # If you have your virtual mailboxes under /var/mail/vmail/ :
+  # return "/var/mail/vmail/$domain/$local_part/Maildir/maildirsize";
+
+  # We use hashed subdirectories for virtual mailboxes
+  my $home = "/vmail/maildirs";
+  # Get the first 3 characters of the domain name
+  (my $tmp = $domain) =~ s/^(...).*/$1/;
+  foreach my $char (split(//,$tmp)) {
+    $home .= '/';
+    $home .= $char =~ /\w/ ? $char : '_';
+  }
+  my $file="$home/$domain/$local_part/Maildir/maildirsize";
+  return $file;
+}
+
+# No user configurable options past this point
+
+# Global variables
+my ($client,$log);
+my %opts = ( database => 1 );
+
+GetOptions( \%opts,
+  'debug',
+  'database!',
+  'pidfile:s'
+);
+
+$0 = "exim-policyd";
+$SIG{CHLD} = "IGNORE";
+Proc::Daemon::Init();
+$log = Log::Handler->new(
+         file => {
+           filename => "/var/log/helper/exim.log",
+           maxlevel => 'debug',
+           minlevel => 'emergency',
+           timeformat => "%Y/%m/%d %H:%M:%S",
+           message_layout => "%T [%L] %m"
+         } );
+
+$opts{'pidfile'} ||= "/var/run/helper/exim-policyd.pid";
+open(my $pidfh, '>', $opts{'pidfile'}) or do {
+  $log->critical("Unable to write '".$opts{'pidfile'}."': $!");
+  exit(1);
+};
+print $pidfh $$;
+close $pidfh;
+
+$log->info("Started, PID=$$");
+
+my $socket = IO::Socket::INET->new(
+               Proto => "tcp",
+               LocalPort => $listen_port,
+               Reuse => 1,
+               Listen => 1) or $log->error("ERROR: $!");
+
+while($client=$socket->accept()) {
+  next if my $pid=fork;
+  $log->error("Cannot fork $!") unless defined $pid;
+  my $host = $client->peerhost();
+  $log->debug("Connection received from ".$host) if $opts{'debug'};
+  while (defined(my $buf=<$client>)) {
+    $log->debug("Received: $buf") if $opts{'debug'};
+    my ($func,@VALS) = parse_input($buf);
+    if ($func eq "CHECK_QUOTA") {
+      my $rv = is_quota_met(@VALS);
+      $client->send("$rv");
+      last;
+    }
+    elsif ($func eq "SHOW_QUOTA") {
+      my $rv = show_quota(@VALS);
+      $client->send("$rv\n");
+    }
+    elsif ($func eq "REMOVE_BLOCKED_SMTP_AUTH") {
+      my $rv = remove_blocked_smtp_auth(@VALS);
+      $client->send("$rv\n");
+    }
+    elsif ($func eq "VERIFY_EMAIL") {
+      my $rv = check_email_routing(@VALS);
+      $client->send("$rv\n");
+    }
+    elsif ($func eq "QUIT") {
+      $client->send("Bye!\n");
+      last;
+    }
+  }
+  $client->shutdown(2);
+  exit;
+}
+
+sub parse_input {
+  my @DATA = split(/\s/,shift());
+  $DATA[0] = uc($DATA[0]) if $DATA[0];
+  return(@DATA);
+}
+
+sub check_email_routing {
+  my $email = shift();
+  return ("No email passed") if (not $email);
+  my @output = `/usr/sbin/exim -bt $email 2>&1`;
+  return( join('',@output,"END"));
+}
+
+sub remove_blocked_smtp_auth {
+  my $ip = shift();
+  return ("No IP address passed") if (not $ip);
+  my @output = `/IV/projects/IV_webmail/scripts/remove_blocked_IP.sh '$ip'`;
+  return( join('',@output));
+}
+
+sub show_quota {
+  my ($size,$quota) = _calculate_quota(@_);
+  return("using=$size limit=$quota available=".($quota-$size));
+}
+
+sub is_quota_met {
+  my ($size,$quota) = _calculate_quota(@_);
+  # 1 => over quota, 0 => still has space left
+  return (($size > $quota) ? 1 : 0);
+}
+
+sub _calculate_quota {
+  # Prints out 0 if not over quota
+  # Prints out 1 if over quota (means "not ok")
+  my $local_part = shift();
+  my $domain     = shift();
+  return(0,0) if (!defined $local_part || !defined $domain);
+  $log->debug("Asked for quota for $local_part\@$domain")
+    if $opts{'debug'};
+  my ($dbsize,$dbquota) = _quota_from_db($local_part,$domain);
+  # -1 means that the email address is a forwarder
+  return(0,0) if $dbsize == -1;
+  my $file=_generate_maildir_path($local_part,$domain);
+  -f "$file" or return(0,0);
+  open(my $fh, "<", $file) or return(0,0);
+  my @lines = <$fh>;
+  close($fh);
+  #return(0,0) if (scalar @lines == 0);
+  return(0,0)
+    if (scalar @lines == 0);
+  $log->debug("Read ".scalar @lines." lines from $file")
+    if $opts{'debug'};
+  
+  my ($quota,$qcount);  # count is calculated, but ignored
+  my @quota = split(/,/,$lines[0]);
+  if (scalar @quota > 0) {
+    $quota  = substr($quota[0],0,-1)
+      if (substr($quota[0],-1) eq 'S');
+    $qcount = substr($quota[0],0,-1)
+      if (substr($quota[0],-1) eq 'C');
+  }
+  #return(0,0) if (!defined $quota);
+  return($dbsize,$dbquota)
+    if (!defined $quota);
+  
+  my $line=my $size=my $msgs=0;
+  do {
+    $line++;
+    (my $msgsize, my $msgcount) = split(" ", $lines[$line]);
+    $size+=$msgsize; $msgs+=$msgcount;
+  } while ($line < $#lines);
+  $quota = ($dbquota == $quota) ? $quota : $dbquota;
+  $log->info("Usage/Quota for $local_part\@$domain is $size / $quota");
+  return($size,$quota);
+}
+
+sub _quota_from_db {
+  my $localpart = shift();
+  my $domain = shift();
+  # If started with --no-database, don't check
+  return(0,0) unless $opts{'database'};
+  my $datasource = 'dbi:'.$dbdriver.':'.$database.':'.$dbserver;
+  my $dbh = DBI->connect($datasource,$dbusername,$dbpassword);
+  if (!$dbh) {
+    $log->error("Failed to DBI->connect $localpart\@$domain: ".DBI->errstr());
+    return(0,0);
+  }
+  my $q = "SELECT e.quota,e.email_type_id FROM email AS e ".
+          "JOIN domain AS d ON d.id=e.domain_id ".
+          "WHERE e.name=? ".
+          "  AND d.name=? ";
+  my $sth;
+  unless ($sth = $dbh->prepare($q)) {
+    $log->error("Failed to DBI->prepare $localpart\@$domain: ".$dbh->errstr());
+    $dbh->disconnect();
+    return(0,0);
+  }
+  if(!$sth->execute($localpart,$domain)) {
+    $log->error("Failed to sth->execute $localpart\@$domain: ".$dbh->errstr());
+    $sth->finish();
+    $dbh->disconnect();
+    return(0,0);
+  }
+  my $size  = 0;
+  my $quota = 0;
+  while(my $row = $sth->fetchrow_hashref()) {
+    return(-1,-1)
+      if $row->{'email_type_id'} == 3;
+    $quota = $row->{'quota'};
+    $log->debug("Found DB quota $quota for $localpart\@$domain")
+      if $opts{'debug'};
+    $sth->finish();
+    last;
+  }
+  $dbh->disconnect();
+  $log->info("Usage/Quota from dB for $localpart\@$domain is $size / $quota");
+  return($size,$quota);
+}

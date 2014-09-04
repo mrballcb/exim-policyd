@@ -1,0 +1,76 @@
+#!/bin/bash
+#
+# exim-policyd  This shell script takes care of starting and stopping exim-policyd
+#
+# chkconfig: 2345 80 30
+# description: exim-policyd is a utility script
+# processname: exim-policyd
+# config: none
+# pidfile: /var/run/helper/exim-policyd.pid
+
+progdir="/usr/local/bin"
+prog="exim-policyd"
+RUNAS="vmail"   # What user owns your virtual mailboxes
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+if [ -f /etc/sysconfig/$prog ]; then
+  . /etc/sysconfig/$prog
+fi
+
+RETVAL=0
+
+[ -x ${progdir}/${prog} ] || exit 0
+
+start() {
+  # Start daemons.
+
+  echo -n "Starting $prog: "
+  daemon --user $RUNAS ${progdir}/${prog} $OPTIONS
+  RETVAL=$?
+  echo
+  [ $RETVAL -eq 0 ] && touch /var/lock/subsys/${prog}
+  return $RETVAL
+}
+
+stop() {
+  # Stop daemons.
+  echo -n "Shutting down $prog: "
+  killproc ${prog}
+  RETVAL=$?
+  echo
+  [ $RETVAL -eq 0 ] && rm -f /var/lock/subsys/${prog}
+  return $RETVAL
+}
+
+# See how we were called.
+case "$1" in
+  start)
+  start
+  ;;
+  stop)
+  stop
+  ;;
+  restart|reload)
+  stop
+  start
+  RETVAL=$?
+  ;;
+  condrestart)
+  if [ -f /var/lock/subsys/${prog} ]; then
+      stop
+      start
+      RETVAL=$?
+  fi
+  ;;
+  status)
+  status ${prog}
+  RETVAL=$?
+  ;;
+  *)
+  echo "Usage: $0 {start|stop|restart|condrestart|status}"
+  exit 1
+esac
+
+exit $RETVAL

@@ -1,0 +1,8 @@
+# Copious amounts of logging to troubleshoot problems
+#OPTIONS="--debug"
+
+# Skip database checks
+#OPTIONS="--no-database"
+
+# What user the daemon should run as, overrides the default
+RUNAS=vmail
